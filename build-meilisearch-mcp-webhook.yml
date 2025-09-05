@@ -1,0 +1,217 @@
+name: Build MeiliSearch MCP Docker Image (Webhook-based)
+
+on:
+  # Trigger on push to the docker directory (where Dockerfile is maintained)
+  push:
+    paths:
+      - 'docker/**'
+      - '.github/workflows/build-meilisearch-mcp-webhook.yml'
+  
+  # Trigger on manual dispatch
+  workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: 'Upstream commit SHA to build (optional)'
+        required: false
+        type: string
+  
+  # Trigger when upstream repository is updated via webhook
+  repository_dispatch:
+    types: [upstream-push, upstream-release]
+
+env:
+  UPSTREAM_REPO: meilisearch/meilisearch-mcp
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/meilisearch-mcp
+
+jobs:
+  build-from-upstream:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Determine upstream SHA
+        id: upstream
+        run: |
+          # Use provided SHA from webhook or manual input, otherwise get latest
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            # SHA from webhook payload
+            UPSTREAM_SHA="${{ github.event.client_payload.sha }}"
+            UPSTREAM_REF="${{ github.event.client_payload.ref }}"
+            UPSTREAM_MESSAGE="${{ github.event.client_payload.message }}"
+            UPSTREAM_AUTHOR="${{ github.event.client_payload.author }}"
+            echo "Webhook trigger - SHA: $UPSTREAM_SHA"
+            echo "Ref: $UPSTREAM_REF"
+            echo "Message: $UPSTREAM_MESSAGE"
+            echo "Author: $UPSTREAM_AUTHOR"
+          elif [[ -n "${{ github.event.inputs.upstream_sha }}" ]]; then
+            # SHA from manual workflow dispatch
+            UPSTREAM_SHA="${{ github.event.inputs.upstream_sha }}"
+            echo "Manual trigger - SHA: $UPSTREAM_SHA"
+          else
+            # Get latest SHA from upstream
+            UPSTREAM_SHA=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/commits/main | jq -r '.sha')
+            echo "Getting latest upstream SHA: $UPSTREAM_SHA"
+          fi
+          
+          if [[ -z "$UPSTREAM_SHA" ]] || [[ "$UPSTREAM_SHA" == "null" ]]; then
+            echo "Error: Could not determine upstream SHA"
+            exit 1
+          fi
+          
+          echo "sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+          echo "ref=$UPSTREAM_REF" >> $GITHUB_OUTPUT
+          echo "message=$UPSTREAM_MESSAGE" >> $GITHUB_OUTPUT
+          echo "author=$UPSTREAM_AUTHOR" >> $GITHUB_OUTPUT
+      
+      - name: Check if already built
+        id: check_built
+        run: |
+          # Check if we've already built this SHA
+          if [ -f .last_upstream_sha ]; then
+            LAST_SHA=$(cat .last_upstream_sha)
+            if [[ "$LAST_SHA" == "${{ steps.upstream.outputs.sha }}" ]]; then
+              echo "Already built SHA: ${{ steps.upstream.outputs.sha }}"
+              echo "skip=true" >> $GITHUB_OUTPUT
+            else
+              echo "New SHA to build: ${{ steps.upstream.outputs.sha }}"
+              echo "skip=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No previous build found"
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Override skip if this is a manual trigger or push event
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
+             [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "Force build due to manual trigger or push event"
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Clone upstream repository
+        if: steps.check_built.outputs.skip != 'true'
+        run: |
+          git clone https://github.com/${{ env.UPSTREAM_REPO }}.git upstream-source
+          cd upstream-source
+          git checkout ${{ steps.upstream.outputs.sha }}
+          
+          # Log commit information
+          echo "Building from commit:"
+          git log -1 --oneline
+      
+      - name: Set up Docker Buildx
+        if: steps.check_built.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GitHub Container Registry
+        if: steps.check_built.outputs.skip != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        if: steps.check_built.outputs.skip != 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-,suffix=-{{date 'YYYYMMDD-HHmmss'}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.upstream.outputs.sha }},prefix=upstream-
+            type=raw,value=${{ steps.upstream.outputs.sha }},prefix=sha-,suffix=,enable=true,priority=200
+          labels: |
+            org.opencontainers.image.title=MeiliSearch MCP Server
+            org.opencontainers.image.description=MCP server for MeiliSearch built from upstream
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            upstream.sha=${{ steps.upstream.outputs.sha }}
+            upstream.ref=${{ steps.upstream.outputs.ref }}
+            upstream.message=${{ steps.upstream.outputs.message }}
+            upstream.author=${{ steps.upstream.outputs.author }}
+      
+      - name: Build and push Docker image
+        if: steps.check_built.outputs.skip != 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./upstream-source
+          file: ./docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            UPSTREAM_SHA=${{ steps.upstream.outputs.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            UPSTREAM_REF=${{ steps.upstream.outputs.ref }}
+      
+      - name: Update last built SHA
+        if: steps.check_built.outputs.skip != 'true'
+        run: |
+          echo "${{ steps.upstream.outputs.sha }}" > .last_upstream_sha
+          
+          # Also create a build log entry
+          mkdir -p .build-history
+          BUILD_LOG=".build-history/$(date +%Y%m%d-%H%M%S)-${{ steps.upstream.outputs.sha }}.json"
+          cat > "$BUILD_LOG" << EOF
+          {
+            "sha": "${{ steps.upstream.outputs.sha }}",
+            "ref": "${{ steps.upstream.outputs.ref }}",
+            "message": "${{ steps.upstream.outputs.message }}",
+            "author": "${{ steps.upstream.outputs.author }}",
+            "build_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "trigger": "${{ github.event_name }}",
+            "workflow_run": "${{ github.run_id }}",
+            "tags": ${{ toJSON(steps.meta.outputs.tags) }}
+          }
+          EOF
+          
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .last_upstream_sha .build-history/
+          git diff --staged --quiet || (git commit -m "Update build tracking for upstream SHA ${{ steps.upstream.outputs.sha }}" && git push)
+      
+      - name: Create GitHub Release
+        if: steps.check_built.outputs.skip != 'true' && github.event_name == 'repository_dispatch' && github.event.action == 'upstream-release'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: upstream-${{ steps.upstream.outputs.sha }}
+          name: Build from upstream ${{ steps.upstream.outputs.sha }}
+          body: |
+            ## Docker Image Build from Upstream
+            
+            **Upstream SHA**: `${{ steps.upstream.outputs.sha }}`
+            **Upstream Ref**: `${{ steps.upstream.outputs.ref }}`
+            **Commit Message**: ${{ steps.upstream.outputs.message }}
+            **Author**: ${{ steps.upstream.outputs.author }}
+            
+            ### Docker Image
+            
+            Pull the image:
+            ```bash
+            docker pull ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:upstream-${{ steps.upstream.outputs.sha }}
+            ```
+            
+            ### Source
+            Upstream repository: https://github.com/${{ env.UPSTREAM_REPO }}
+            Commit: https://github.com/${{ env.UPSTREAM_REPO }}/commit/${{ steps.upstream.outputs.sha }}
+          draft: false
+          prerelease: false
+      
+      - name: Send build notification
+        if: steps.check_built.outputs.skip != 'true' && always()
+        run: |
+          if [[ "${{ job.status }}" == "success" ]]; then
+            echo "✅ Successfully built Docker image from upstream SHA: ${{ steps.upstream.outputs.sha }}"
+          else
+            echo "❌ Failed to build Docker image from upstream SHA: ${{ steps.upstream.outputs.sha }}"
+          fi

@@ -1,0 +1,258 @@
+name: Build MeiliSearch MCP Docker Image (Pure Webhook)
+
+on:
+  # Trigger on push to the docker directory (local changes)
+  push:
+    paths:
+      - 'docker/**'
+      - '.github/workflows/build-meilisearch-mcp-pure-webhook.yml'
+  
+  # Manual trigger with optional SHA
+  workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: 'Upstream commit SHA to build'
+        required: false
+        type: string
+      force_build:
+        description: 'Force build even if SHA already built'
+        required: false
+        type: boolean
+        default: false
+  
+  # Webhook trigger - NO POLLING, only external triggers
+  repository_dispatch:
+    types: 
+      - upstream-push
+      - upstream-release
+      - upstream-tag
+      - build-request
+
+env:
+  UPSTREAM_REPO: meilisearch/meilisearch-mcp
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/meilisearch-mcp
+
+jobs:
+  build-from-webhook:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Process webhook payload
+        id: webhook
+        run: |
+          echo "📨 Processing webhook event: ${{ github.event_name }}"
+          
+          # Extract information based on trigger type
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            EVENT_TYPE="${{ github.event.action }}"
+            SHA="${{ github.event.client_payload.sha }}"
+            REF="${{ github.event.client_payload.ref }}"
+            MESSAGE="${{ github.event.client_payload.message }}"
+            AUTHOR="${{ github.event.client_payload.author }}"
+            TIMESTAMP="${{ github.event.client_payload.timestamp }}"
+            TAG="${{ github.event.client_payload.tag }}"
+            FORCE="${{ github.event.client_payload.force_build }}"
+            
+            echo "Webhook Event Type: $EVENT_TYPE"
+            echo "SHA: $SHA"
+            echo "Ref: $REF"
+            echo "Message: $MESSAGE"
+            echo "Author: $AUTHOR"
+            echo "Tag: $TAG"
+            
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Manual trigger
+            if [[ -n "${{ github.event.inputs.upstream_sha }}" ]]; then
+              SHA="${{ github.event.inputs.upstream_sha }}"
+            else
+              # Get latest from upstream if no SHA provided
+              SHA=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/commits/main | jq -r '.sha')
+            fi
+            REF="main"
+            MESSAGE="Manual build trigger"
+            AUTHOR="${{ github.actor }}"
+            EVENT_TYPE="manual"
+            FORCE="${{ github.event.inputs.force_build }}"
+            
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            # Local changes - get latest upstream
+            SHA=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/commits/main | jq -r '.sha')
+            REF="main"
+            MESSAGE="Build triggered by local changes"
+            AUTHOR="${{ github.actor }}"
+            EVENT_TYPE="local-change"
+            FORCE="false"
+          fi
+          
+          # Validate SHA
+          if [[ -z "$SHA" ]] || [[ "$SHA" == "null" ]]; then
+            echo "❌ Error: Could not determine upstream SHA"
+            exit 1
+          fi
+          
+          # Output all variables
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "ref=$REF" >> $GITHUB_OUTPUT
+          echo "message=$MESSAGE" >> $GITHUB_OUTPUT
+          echo "author=$AUTHOR" >> $GITHUB_OUTPUT
+          echo "event_type=$EVENT_TYPE" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "force=$FORCE" >> $GITHUB_OUTPUT
+      
+      - name: Check build cache
+        id: cache
+        run: |
+          SHOULD_BUILD="true"
+          
+          # Check if we've already built this SHA
+          if [[ -f .build-cache/${{ steps.webhook.outputs.sha }}.json ]]; then
+            echo "⚠️ SHA ${{ steps.webhook.outputs.sha }} has already been built"
+            
+            if [[ "${{ steps.webhook.outputs.force }}" == "true" ]]; then
+              echo "✅ Force build requested - proceeding anyway"
+              SHOULD_BUILD="true"
+            else
+              echo "⏭️ Skipping build (use force_build to override)"
+              SHOULD_BUILD="false"
+              
+              # Output previous build info
+              echo "Previous build info:"
+              cat .build-cache/${{ steps.webhook.outputs.sha }}.json
+            fi
+          else
+            echo "✅ New SHA detected - proceeding with build"
+          fi
+          
+          echo "should_build=$SHOULD_BUILD" >> $GITHUB_OUTPUT
+      
+      - name: Clone upstream repository
+        if: steps.cache.outputs.should_build == 'true'
+        run: |
+          echo "📥 Cloning upstream repository..."
+          git clone https://github.com/${{ env.UPSTREAM_REPO }}.git upstream-source
+          cd upstream-source
+          git checkout ${{ steps.webhook.outputs.sha }}
+          
+          # Display commit info
+          echo "Building from commit:"
+          git log -1 --pretty=format:"SHA: %H%nAuthor: %an <%ae>%nDate: %ad%nMessage: %s%n"
+      
+      - name: Set up Docker Buildx
+        if: steps.cache.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GitHub Container Registry
+        if: steps.cache.outputs.should_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Generate Docker tags
+        if: steps.cache.outputs.should_build == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.webhook.outputs.sha }},prefix=sha-
+            type=raw,value=${{ steps.webhook.outputs.sha }},prefix=upstream-
+            type=raw,value=${{ steps.webhook.outputs.tag }},enable=${{ steps.webhook.outputs.tag != '' }}
+            type=raw,value={{date 'YYYYMMDD-HHmmss'}},prefix=build-
+          labels: |
+            org.opencontainers.image.title=MeiliSearch MCP Server
+            org.opencontainers.image.description=MCP server for MeiliSearch
+            upstream.sha=${{ steps.webhook.outputs.sha }}
+            upstream.ref=${{ steps.webhook.outputs.ref }}
+            build.trigger=${{ steps.webhook.outputs.event_type }}
+            build.author=${{ steps.webhook.outputs.author }}
+      
+      - name: Build and push Docker image
+        if: steps.cache.outputs.should_build == 'true'
+        id: docker
+        uses: docker/build-push-action@v5
+        with:
+          context: ./upstream-source
+          file: ./docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            UPSTREAM_SHA=${{ steps.webhook.outputs.sha }}
+            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+      
+      - name: Record build in cache
+        if: steps.cache.outputs.should_build == 'true'
+        run: |
+          # Create cache directory
+          mkdir -p .build-cache
+          
+          # Create build record
+          BUILD_RECORD=".build-cache/${{ steps.webhook.outputs.sha }}.json"
+          cat > "$BUILD_RECORD" << EOF
+          {
+            "sha": "${{ steps.webhook.outputs.sha }}",
+            "ref": "${{ steps.webhook.outputs.ref }}",
+            "message": "${{ steps.webhook.outputs.message }}",
+            "author": "${{ steps.webhook.outputs.author }}",
+            "event_type": "${{ steps.webhook.outputs.event_type }}",
+            "tag": "${{ steps.webhook.outputs.tag }}",
+            "build_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "workflow_run": "${{ github.run_id }}",
+            "workflow_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "docker_digest": "${{ steps.docker.outputs.digest }}",
+            "docker_tags": ${{ toJSON(steps.meta.outputs.tags) }}
+          }
+          EOF
+          
+          # Update latest pointer
+          echo "${{ steps.webhook.outputs.sha }}" > .build-cache/LATEST
+          
+          # Commit cache update
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .build-cache/
+          git commit -m "🐳 Built Docker image for ${{ steps.webhook.outputs.sha }}" || true
+          git push || true
+      
+      - name: Create summary
+        if: always()
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ steps.cache.outputs.should_build }}" == "true" ]]; then
+            if [[ "${{ steps.docker.outcome }}" == "success" ]]; then
+              echo "✅ **Build Successful**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### Docker Image" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+              echo "docker pull ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.webhook.outputs.sha }}" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ **Build Failed**" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "⏭️ **Build Skipped** - SHA already built" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Build Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger**: ${{ steps.webhook.outputs.event_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **SHA**: \`${{ steps.webhook.outputs.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Ref**: \`${{ steps.webhook.outputs.ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Author**: ${{ steps.webhook.outputs.author }}" >> $GITHUB_STEP_SUMMARY
+          if [[ -n "${{ steps.webhook.outputs.tag }}" ]]; then
+            echo "- **Tag**: \`${{ steps.webhook.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- **Upstream**: [meilisearch/meilisearch-mcp](https://github.com/${{ env.UPSTREAM_REPO }})" >> $GITHUB_STEP_SUMMARY

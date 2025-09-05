@@ -1,0 +1,195 @@
+name: Monitor Upstream Repository
+
+on:
+  # Run every hour to check for updates
+  schedule:
+    - cron: '0 * * * *'  # Every hour
+  
+  # Manual trigger for testing
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: meilisearch/meilisearch-mcp
+  UPSTREAM_OWNER: meilisearch
+  UPSTREAM_NAME: meilisearch-mcp
+
+jobs:
+  check-and-trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Get upstream commits
+        id: check_upstream
+        run: |
+          # Get the latest commits from upstream
+          echo "Fetching latest commits from upstream repository..."
+          
+          # Get the last 5 commits to check for any new ones
+          COMMITS_JSON=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/commits?per_page=5")
+          
+          # Get the latest commit SHA
+          LATEST_SHA=$(echo "$COMMITS_JSON" | jq -r '.[0].sha')
+          LATEST_MESSAGE=$(echo "$COMMITS_JSON" | jq -r '.[0].commit.message' | head -1)
+          LATEST_AUTHOR=$(echo "$COMMITS_JSON" | jq -r '.[0].commit.author.name')
+          LATEST_DATE=$(echo "$COMMITS_JSON" | jq -r '.[0].commit.author.date')
+          
+          echo "Latest upstream commit:"
+          echo "  SHA: $LATEST_SHA"
+          echo "  Message: $LATEST_MESSAGE"
+          echo "  Author: $LATEST_AUTHOR"
+          echo "  Date: $LATEST_DATE"
+          
+          echo "latest_sha=$LATEST_SHA" >> $GITHUB_OUTPUT
+          echo "latest_message=$LATEST_MESSAGE" >> $GITHUB_OUTPUT
+          echo "latest_author=$LATEST_AUTHOR" >> $GITHUB_OUTPUT
+          echo "latest_date=$LATEST_DATE" >> $GITHUB_OUTPUT
+      
+      - name: Check last processed commit
+        id: check_last
+        run: |
+          # Check if we have a record of the last processed commit
+          if [ -f .last_monitored_sha ]; then
+            LAST_SHA=$(cat .last_monitored_sha)
+            echo "Last monitored SHA: $LAST_SHA"
+          else
+            LAST_SHA=""
+            echo "No previous monitoring record found"
+          fi
+          
+          echo "last_sha=$LAST_SHA" >> $GITHUB_OUTPUT
+      
+      - name: Check for upstream releases
+        id: check_releases
+        run: |
+          # Check if there are any new releases
+          LATEST_RELEASE=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest")
+          
+          if [[ $(echo "$LATEST_RELEASE" | jq -r '.message') != "Not Found" ]]; then
+            RELEASE_TAG=$(echo "$LATEST_RELEASE" | jq -r '.tag_name')
+            RELEASE_SHA=$(echo "$LATEST_RELEASE" | jq -r '.target_commitish')
+            RELEASE_NAME=$(echo "$LATEST_RELEASE" | jq -r '.name')
+            
+            echo "Latest release found:"
+            echo "  Tag: $RELEASE_TAG"
+            echo "  SHA: $RELEASE_SHA"
+            echo "  Name: $RELEASE_NAME"
+            
+            echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+            echo "release_sha=$RELEASE_SHA" >> $GITHUB_OUTPUT
+            echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+            echo "has_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "No releases found"
+            echo "has_release=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Trigger build workflow if needed
+        if: steps.check_last.outputs.last_sha != steps.check_upstream.outputs.latest_sha
+        run: |
+          echo "New commit detected! Triggering build workflow..."
+          
+          # Trigger the webhook-based workflow using repository_dispatch
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{
+              "event_type": "upstream-push",
+              "client_payload": {
+                "sha": "${{ steps.check_upstream.outputs.latest_sha }}",
+                "ref": "main",
+                "message": "${{ steps.check_upstream.outputs.latest_message }}",
+                "author": "${{ steps.check_upstream.outputs.latest_author }}",
+                "date": "${{ steps.check_upstream.outputs.latest_date }}",
+                "triggered_by": "monitor-workflow"
+              }
+            }'
+          
+          echo "Build workflow triggered successfully"
+      
+      - name: Trigger release build if new release
+        if: steps.check_releases.outputs.has_release == 'true'
+        run: |
+          # Check if we've already built this release
+          if [ -f .last_release_tag ]; then
+            LAST_RELEASE_TAG=$(cat .last_release_tag)
+            if [[ "$LAST_RELEASE_TAG" == "${{ steps.check_releases.outputs.release_tag }}" ]]; then
+              echo "Release ${{ steps.check_releases.outputs.release_tag }} already built"
+              exit 0
+            fi
+          fi
+          
+          echo "New release detected! Triggering release build..."
+          
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{
+              "event_type": "upstream-release",
+              "client_payload": {
+                "sha": "${{ steps.check_releases.outputs.release_sha }}",
+                "ref": "${{ steps.check_releases.outputs.release_tag }}",
+                "message": "Release: ${{ steps.check_releases.outputs.release_name }}",
+                "author": "upstream-release",
+                "release_tag": "${{ steps.check_releases.outputs.release_tag }}",
+                "triggered_by": "monitor-workflow"
+              }
+            }'
+          
+          # Update last release tag
+          echo "${{ steps.check_releases.outputs.release_tag }}" > .last_release_tag
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .last_release_tag
+          git commit -m "Track release ${{ steps.check_releases.outputs.release_tag }}" || true
+          git push || true
+      
+      - name: Update monitoring record
+        if: steps.check_last.outputs.last_sha != steps.check_upstream.outputs.latest_sha
+        run: |
+          # Update the last monitored SHA
+          echo "${{ steps.check_upstream.outputs.latest_sha }}" > .last_monitored_sha
+          
+          # Create monitoring log
+          mkdir -p .monitoring-logs
+          LOG_FILE=".monitoring-logs/$(date +%Y%m%d-%H%M%S).json"
+          cat > "$LOG_FILE" << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "previous_sha": "${{ steps.check_last.outputs.last_sha }}",
+            "new_sha": "${{ steps.check_upstream.outputs.latest_sha }}",
+            "message": "${{ steps.check_upstream.outputs.latest_message }}",
+            "author": "${{ steps.check_upstream.outputs.latest_author }}",
+            "action": "triggered-build"
+          }
+          EOF
+          
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .last_monitored_sha .monitoring-logs/
+          git commit -m "Update monitoring: detected new commit ${{ steps.check_upstream.outputs.latest_sha }}" || true
+          git push || true
+      
+      - name: Summary
+        run: |
+          echo "## Monitoring Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Upstream Repository**: [${{ env.UPSTREAM_REPO }}](https://github.com/${{ env.UPSTREAM_REPO }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Current Status" >> $GITHUB_STEP_SUMMARY
+          echo "- **Latest SHA**: \`${{ steps.check_upstream.outputs.latest_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Last Monitored SHA**: \`${{ steps.check_last.outputs.last_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ steps.check_last.outputs.last_sha }}" != "${{ steps.check_upstream.outputs.latest_sha }}" ]]; then
+            echo "✅ **New commit detected** - Build workflow triggered" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ No new commits detected" >> $GITHUB_STEP_SUMMARY
+          fi
