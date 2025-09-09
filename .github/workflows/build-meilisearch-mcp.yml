@@ -44,8 +44,9 @@ jobs:
         id: last_built
         run: |
           # Try to get the last built SHA from a file in the repo
-          if [ -f .last_upstream_sha ]; then
-            LAST_SHA=$(cat .last_upstream_sha)
+          if [ -f .github/last_upstream_sha.txt ]; then
+            # Extract SHA from the file (skip comments and timestamp)
+            LAST_SHA=$(grep '^SHA:' .github/last_upstream_sha.txt | cut -d' ' -f2 || echo "")
           else
             LAST_SHA=""
           fi
@@ -127,11 +128,24 @@ jobs:
 
       - name: Update last built SHA
         run: |
-          echo "${{ needs.check-upstream.outputs.upstream_sha }}" > .last_upstream_sha
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add .last_upstream_sha
-          git diff --staged --quiet || (git commit -m "Update last built upstream SHA to ${{ needs.check-upstream.outputs.upstream_sha }}" && git push)
+          # Save the SHA and timestamp to the tracking file
+          echo "# This file tracks the last built upstream commit SHA" > .github/last_upstream_sha.txt
+          echo "# Auto-updated by GitHub Actions" >> .github/last_upstream_sha.txt
+          echo "" >> .github/last_upstream_sha.txt
+          echo "SHA: ${{ needs.check-upstream.outputs.upstream_sha }}" >> .github/last_upstream_sha.txt
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> .github/last_upstream_sha.txt
+          echo "Upstream: https://github.com/${{ env.UPSTREAM_REPO }}/commit/${{ needs.check-upstream.outputs.upstream_sha }}" >> .github/last_upstream_sha.txt
+          
+          # Configure git
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # Commit and push the change
+          git add .github/last_upstream_sha.txt
+          git diff --staged --quiet || (
+            git commit -m "Update last built upstream SHA to ${{ needs.check-upstream.outputs.upstream_sha }}" && 
+            git push
+          )
 
       - name: Create release notes
         if: success()
