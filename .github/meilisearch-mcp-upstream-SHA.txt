@@ -1,6 +1,6 @@
-# This file tracks the last built upstream commit SHA
+# This file tracks the last built upstream commit SHA for meilisearch-mcp
 # Auto-updated by GitHub Actions
 
-SHA: 
-Timestamp: 
-Upstream:
+SHA: 14e0897f6c1fe49a4c9084d0c2f9c08795433516
+Timestamp: 2025-09-12 17:30:23 UTC
+Upstream: https://github.com/meilisearch/meilisearch-mcp/commit/14e0897f6c1fe49a4c9084d0c2f9c08795433516
