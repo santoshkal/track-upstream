@@ -1,16 +1,16 @@
-name: Build MeiliSearch MCP Docker Image
+name: Build MeiliSearch MCP Docker Image V2
 
 on:
   # Trigger on push to the docker directory (where Dockerfile is maintained)
   push:
     paths:
       - "track-upstream/**"
-      - ".github/workflows/build-meilisearch-mcp.yml"
+      - ".github/workflows/build-meilisearch-mcp-v2.yml"
 
   # Trigger on manual dispatch
   workflow_dispatch:
 
-  # Schedule to check upstream repository daily at 2 AM UTC
+  # Schedule to check upstream repository hourly
   schedule:
     - cron: "0 * * * *"
 
@@ -20,6 +20,7 @@ on:
 
 env:
   UPSTREAM_REPO: meilisearch/meilisearch-mcp
+  PROJECT_NAME: meilisearch-mcp
   DOCKER_REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/meilisearch-mcp
 
@@ -29,6 +30,7 @@ jobs:
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      upstream_sha_short: ${{ steps.check.outputs.upstream_sha_short }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,20 +40,23 @@ jobs:
         run: |
           UPSTREAM_SHA=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/commits/main | jq -r '.sha')
           echo "sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+          echo "sha_short=${UPSTREAM_SHA:0:7}" >> $GITHUB_OUTPUT
           echo "Upstream SHA: $UPSTREAM_SHA"
+          echo "Upstream SHA (short): ${UPSTREAM_SHA:0:7}"
 
       - name: Get last built commit SHA
         id: last_built
         run: |
-          # Try to get the last built SHA from a file in the repo
-          if [ -f .github/last_upstream_sha.txt ]; then
+          # Try to get the last built SHA from a project-specific file
+          SHA_FILE=".github/${{ env.PROJECT_NAME }}-upstream-SHA.txt"
+          if [ -f "$SHA_FILE" ]; then
             # Extract SHA from the file (skip comments and timestamp)
-            LAST_SHA=$(grep '^SHA:' .github/last_upstream_sha.txt | cut -d' ' -f2 || echo "")
+            LAST_SHA=$(grep '^SHA:' "$SHA_FILE" | cut -d' ' -f2 || echo "")
           else
             LAST_SHA=""
           fi
           echo "sha=$LAST_SHA" >> $GITHUB_OUTPUT
-          echo "Last built SHA: $LAST_SHA"
+          echo "Last built SHA for ${{ env.PROJECT_NAME }}: $LAST_SHA"
 
       - name: Check if build is needed
         id: check
@@ -72,6 +77,7 @@ jobs:
             echo "Build needed: false"
           fi
           echo "upstream_sha=${{ steps.upstream.outputs.sha }}" >> $GITHUB_OUTPUT
+          echo "upstream_sha_short=${{ steps.upstream.outputs.sha_short }}" >> $GITHUB_OUTPUT
 
   build-and-push:
     needs: check-upstream
@@ -84,11 +90,37 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Prepare
+        id: prep
+        run: |
+          # Ensure we have a short SHA
+          UPSTREAM_SHA="${{ needs.check-upstream.outputs.upstream_sha }}"
+          UPSTREAM_SHA_SHORT="${{ needs.check-upstream.outputs.upstream_sha_short }}"
+          
+          # Fallback if short SHA is empty
+          if [ -z "$UPSTREAM_SHA_SHORT" ]; then
+            UPSTREAM_SHA_SHORT=${UPSTREAM_SHA::7}
+            echo "Using fallback short SHA: $UPSTREAM_SHA_SHORT"
+          fi
+          
+          # Generate timestamp
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          
+          # Output for use in subsequent steps
+          echo "upstream_sha_short=${UPSTREAM_SHA_SHORT}" >> $GITHUB_OUTPUT
+          echo "timestamp=${TIMESTAMP}" >> $GITHUB_OUTPUT
+          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
       - name: Clone upstream repository
         run: |
           git clone https://github.com/${{ env.UPSTREAM_REPO }}.git upstream-source
           cd upstream-source
           git checkout ${{ needs.check-upstream.outputs.upstream_sha }}
+          
+      - name: Copy Dockerfile to build context
+        run: |
+          cp ./Dockerfile ./upstream-source/Dockerfile
+          echo "Copied Dockerfile to upstream-source directory"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -100,50 +132,41 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=sha,prefix={{branch}}-,suffix=-{{date 'YYYYMMDD-HHmmss'}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ needs.check-upstream.outputs.upstream_sha }},prefix=upstream-
-
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: ./upstream-source
           file: ./Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:upstream-${{ steps.prep.outputs.upstream_sha_short }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.upstream_sha_short }}-${{ steps.prep.outputs.timestamp }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
             UPSTREAM_SHA=${{ needs.check-upstream.outputs.upstream_sha }}
-            BUILD_DATE=${{ github.event.repository.updated_at }}
+            BUILD_DATE=${{ steps.prep.outputs.build_date }}
 
       - name: Update last built SHA
         run: |
-          # Save the SHA and timestamp to the tracking file
-          echo "# This file tracks the last built upstream commit SHA" > .github/last_upstream_sha.txt
-          echo "# Auto-updated by GitHub Actions" >> .github/last_upstream_sha.txt
-          echo "" >> .github/last_upstream_sha.txt
-          echo "SHA: ${{ needs.check-upstream.outputs.upstream_sha }}" >> .github/last_upstream_sha.txt
-          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> .github/last_upstream_sha.txt
-          echo "Upstream: https://github.com/${{ env.UPSTREAM_REPO }}/commit/${{ needs.check-upstream.outputs.upstream_sha }}" >> .github/last_upstream_sha.txt
+          # Save the SHA and timestamp to the project-specific tracking file
+          SHA_FILE=".github/${{ env.PROJECT_NAME }}-upstream-SHA.txt"
+          echo "# This file tracks the last built upstream commit SHA for ${{ env.PROJECT_NAME }}" > "$SHA_FILE"
+          echo "# Auto-updated by GitHub Actions" >> "$SHA_FILE"
+          echo "" >> "$SHA_FILE"
+          echo "SHA: ${{ needs.check-upstream.outputs.upstream_sha }}" >> "$SHA_FILE"
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$SHA_FILE"
+          echo "Upstream: https://github.com/${{ env.UPSTREAM_REPO }}/commit/${{ needs.check-upstream.outputs.upstream_sha }}" >> "$SHA_FILE"
           
           # Configure git
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           
           # Commit and push the change
-          git add .github/last_upstream_sha.txt
+          git add "$SHA_FILE"
           git diff --staged --quiet || (
-            git commit -m "Update last built upstream SHA to ${{ needs.check-upstream.outputs.upstream_sha }}" && 
+            git commit -m "Update ${{ env.PROJECT_NAME }} upstream SHA to ${{ needs.check-upstream.outputs.upstream_sha }}" && 
             git push
           )
 
