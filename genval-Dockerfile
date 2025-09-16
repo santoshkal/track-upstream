@@ -1,0 +1,46 @@
+
+# Build stage using Chainguard's Go builder image
+FROM cgr.dev/chainguard/go:latest-dev AS builder
+
+# Set working directory
+WORKDIR /app
+
+# Copy go mod files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy the entire source code
+COPY . .
+
+# Build the binary with optimizations
+# Using the same LDFLAGS from Makefile for consistency
+ARG GIT_VERSION="unknown"
+ARG GIT_HASH="unknown"
+ARG GIT_TREESTATE="clean"
+ARG BUILD_DATE="unknown"
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags="-buildid= \
+    -X sigs.k8s.io/release-utils/version.gitVersion=${GIT_VERSION} \
+    -X sigs.k8s.io/release-utils/version.gitCommit=${GIT_HASH} \
+    -X sigs.k8s.io/release-utils/version.gitTreeState=${GIT_TREESTATE} \
+    -X sigs.k8s.io/release-utils/version.buildDate=${BUILD_DATE} \
+    -w -s" \
+    -o genval .
+
+# Final stage using Chainguard's static distroless image
+FROM cgr.dev/chainguard/static:latest
+
+# Add non-root user (Chainguard images already run as non-root by default)
+# The static image uses uid 65532 (nonroot) by default
+
+# Copy the binary from builder
+COPY --from=builder /app/genval /usr/bin/genval
+
+# Set the entrypoint
+ENTRYPOINT ["/usr/bin/genval"]
+
+# Default command (can be overridden)
+CMD ["--help"]
