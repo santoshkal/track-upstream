@@ -24,6 +24,10 @@ on:
   repository_dispatch:
     types: [upstream-update]
 
+permissions:
+  packages: write
+  contents: read
+
 env:
   UPSTREAM_REPO: intelops/genval
   PROJECT_NAME: genval-mcp
@@ -92,3 +96,4 @@ jobs:
             GIT_VERSION=${{ steps.prep.outputs.BUILD_ID }}
             GIT_HASH=${{ github.sha }}
             BUILD_DATE=${{ steps.prep.outputs.BUILD_DATE }}
+
