@@ -1,5 +1,4 @@
 
-# Build stage using Chainguard's Go builder image
 FROM cgr.dev/chainguard/go:latest-dev AS builder
 
 # Set working directory
