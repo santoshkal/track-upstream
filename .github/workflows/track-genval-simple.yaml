@@ -1,0 +1,96 @@
+name: Build Genval on Upstream Change
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"  # Check every hour
+  push:
+    paths:
+      - ".github/workflows/track-genval-simple.yaml"
+      - "genval-Dockerfile"
+
+env:
+  UPSTREAM_REPO: intelops/genval
+  UPSTREAM_BRANCH: pre-main
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/genval-mcp
+
+jobs:
+  build-if-changed:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check upstream SHA
+        id: check
+        run: |
+          # Get current upstream SHA
+          CURRENT_SHA=$(git ls-remote https://github.com/${{ env.UPSTREAM_REPO }}.git refs/heads/${{ env.UPSTREAM_BRANCH }} | cut -f1)
+          echo "current_sha=${CURRENT_SHA}" >> $GITHUB_OUTPUT
+
+          # Check if we have a stored SHA
+          if [ -f .github/.genval-sha ]; then
+            STORED_SHA=$(cat .github/.genval-sha)
+            echo "Stored SHA: ${STORED_SHA}"
+            echo "Current SHA: ${CURRENT_SHA}"
+
+            if [ "${STORED_SHA}" = "${CURRENT_SHA}" ]; then
+              echo "No changes in upstream"
+              echo "changed=false" >> $GITHUB_OUTPUT
+            else
+              echo "Upstream has changed!"
+              echo "changed=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "First run - no stored SHA found"
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout Genval repo
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_BRANCH }}
+          path: genval
+
+      - name: Copy Dockerfile
+        if: steps.check.outputs.changed == 'true'
+        run: cp genval-Dockerfile genval/Dockerfile
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./genval
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.check.outputs.current_sha }}
+
+      - name: Update stored SHA
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          echo "${{ steps.check.outputs.current_sha }}" > .github/.genval-sha
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add .github/.genval-sha
+          git commit -m "Update Genval SHA to ${{ steps.check.outputs.current_sha }}"
+          git push
